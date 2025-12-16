@@ -1,0 +1,37 @@
+{
+    "dna": {
+        "n_instances": 32561,
+        "n_features": 14,
+        "n_numerical": 6,
+        "n_categorical": 8,
+        "dimensionality": 0.00042996222474739717,
+        "missing_ratio": 0.0,
+        "sparsity": 0.31167654556064,
+        "mean_skewness": 3.078219343192599,
+        "max_skewness": 11.953296998194327,
+        "mean_kurtosis": 30.789929473148245,
+        "avg_correlation": 0.043843381683222375,
+        "max_correlation": 0.21117774088979246,
+        "coefficient_variation": 2.1565069603063365,
+        "avg_cardinality": 12.75,
+        "max_cardinality": 42,
+        "task_type": "classification",
+        "n_classes": 2,
+        "class_imbalance_ratio": 3.152659099604642,
+        "target_entropy": 0.5520112931915918,
+        "normalized_entropy": 0.7963839552022132,
+        "minority_class_pct": 0.2408095574460244
+    },
+    "params": {
+        "learning_rate": 4.183245658874512,
+        "weight_decay_l2": 0.6932458877563477,
+        "batch_size": 256,
+        "dropout": 0.5,
+        "optimizer_type": "adam",
+        "confidence_score": 0.92
+    },
+    "metrics": {
+        "final_accuracy": 0.23598955934285276,
+        "training_time": 8.890279054641724
+    }
+}
