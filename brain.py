@@ -1,3 +1,4 @@
+
 import numpy as np
 import pandas as pd
 import torch
@@ -6,6 +7,7 @@ import torch.nn.functional as F
 import torch.optim as optim
 from sklearn.preprocessing import StandardScaler
 import pickle
+import os
 import warnings
 warnings.filterwarnings('ignore')
 
@@ -71,48 +73,100 @@ class MetaLearner:
         self.scaler = StandardScaler()
         self.model = None
         self.is_trained = False
+        self.knowledge_base_path = "knowledge_base.csv"
         print(f"🧠 Meta-Learner Brain initialized on {self.device}")
 
-    def generate_synthetic_meta_dataset(self, n_datasets=2000):
-        """Generates training data based on expert heuristics (Knowledge Distillation)."""
-        print(f"📦 Bootstrapping with {n_datasets} synthetic datasets...")
-        meta_data = []
-        for _ in range(n_datasets):
-            dna = {
-                'n_instances': np.random.randint(100, 20000), 'n_features': np.random.randint(5, 200),
-                'n_numerical': np.random.randint(0, 50), 'n_categorical': np.random.randint(0, 20),
-                'dimensionality': np.random.uniform(0.001, 0.5), 'missing_ratio': np.random.uniform(0, 0.3),
-                'mean_skewness': np.random.uniform(0, 5), 'max_skewness': np.random.uniform(0, 10),
-                'mean_kurtosis': np.random.uniform(-1, 5), 'avg_correlation': np.random.uniform(0, 0.9),
-                'max_correlation': np.random.uniform(0, 0.99), 'coefficient_variation': np.random.uniform(0.1, 2),
-                'avg_cardinality': np.random.uniform(2, 50), 'class_imbalance_ratio': np.random.uniform(1, 20),
-                'target_entropy': np.random.uniform(0, 2.5), 'normalized_entropy': np.random.uniform(0, 1),
-                'sparsity': np.random.uniform(0, 0.8)
-            }
-            # Heuristics
-            lr = np.clip(0.005 * np.exp(-dna['target_entropy']), 0.0001, 0.01)
-            l2 = 1e-3 * dna['mean_skewness'] if dna['mean_skewness'] > 2.0 else 1e-5
-            l2 = np.clip(l2, 1e-6, 0.1)
-            bs = 128 if dna['n_instances'] > 10000 else (64 if dna['n_instances'] > 5000 else 32)
-            if dna['class_imbalance_ratio'] > 5: bs = 16
-            drop = np.clip(0.1 + (dna['sparsity'] * 0.4), 0.0, 0.5)
-            optim_type = 1 if dna['target_entropy'] > 0.5 else 0
-            
-            sample = {**dna, 'learning_rate': lr, 'weight_decay_l2': l2, 'batch_size': bs, 'dropout': drop, 'optimizer_type': optim_type}
-            meta_data.append(sample)
-        return pd.DataFrame(meta_data)
+    def _bootstrap_heuristics(self, dna):
+        """Step A: Cold Start Heuristics (The Old 'Brain') used when no data exists."""
+        print("🧊 Cold Start: Using Heuristics to bootstrap...")
+        lr = np.clip(0.005 * np.exp(-dna.get('target_entropy', 1.0)), 0.0001, 0.01)
+        l2 = 1e-3 * dna.get('mean_skewness', 0) if dna.get('mean_skewness', 0) > 2.0 else 1e-5
+        l2 = np.clip(l2, 1e-6, 0.1)
+        
+        n_inst = dna.get('n_instances', 1000)
+        bs = 128 if n_inst > 10000 else (64 if n_inst > 5000 else 32)
+        if dna.get('class_imbalance_ratio', 1) > 5: bs = 16
+        
+        drop = np.clip(0.1 + (dna.get('sparsity', 0) * 0.4), 0.0, 0.5)
+        optim_type = 'adam' if dna.get('target_entropy', 0) > 0.5 else 'sgd' # Check this logic later, simpler is often better for simple tasks
+        
+        return {
+            'learning_rate': float(lr),
+            'weight_decay_l2': float(l2),
+            'batch_size': int(bs),
+            'dropout': float(drop),
+            'optimizer_type': optim_type
+        }
+
+    def store_experience(self, dna, hyperparameters, metric):
+        """Step B: The Feedback Loop - Save run results to Knowledge Base."""
+        # Flatten everything into one row
+        row = dna.copy()
+        row.update(hyperparameters)
+        row['final_metric'] = metric
+        
+        # Optimizer mapping for regression readiness
+        row['optimizer_type_code'] = 1 if hyperparameters['optimizer_type'] == 'adam' else 0
+        
+        df_row = pd.DataFrame([row])
+        
+        if not os.path.exists(self.knowledge_base_path):
+            df_row.to_csv(self.knowledge_base_path, index=False)
+        else:
+            # Reorder columns to match existing file
+            try:
+                # Read only header
+                existing_columns = pd.read_csv(self.knowledge_base_path, nrows=0).columns.tolist()
+                # Add missing columns with default 0
+                for col in existing_columns:
+                    if col not in df_row.columns:
+                        df_row[col] = 0
+                # Ensure order matches
+                df_row = df_row[existing_columns]
+                df_row.to_csv(self.knowledge_base_path, mode='a', header=False, index=False)
+            except pd.errors.EmptyDataError:
+                # File exists but empty?
+                df_row.to_csv(self.knowledge_base_path, index=False)
+        print(f"💾 Experience stored to '{self.knowledge_base_path}'")
 
     def train(self, epochs=50):
-        df = self.generate_synthetic_meta_dataset()
-        X = self.scaler.fit_transform(df[self.input_features].values)
+        """Step C: Evolutionary Selection (Survival of the Fittest)."""
+        if not os.path.exists(self.knowledge_base_path):
+            print("⚠️ No Knowledge Base found. Skipping training.")
+            return
+
+        df = pd.read_csv(self.knowledge_base_path)
+        if len(df) < 5:
+            print(f"⚠️ Not enough data to train (Found {len(df)} records, need 5). Using heuristics.")
+            return
+
+        # === EVOLUTIONARY SELECTION ===
+        # Filter for the Top 50% of runs based on final_metric
+        # We assume higher metric is better (Accuracy, R2).
+        median_perf = df['final_metric'].median()
+        df_elite = df[df['final_metric'] >= median_perf]
+        
+        print(f"\n🎓 Training Meta-Brain on ELITE History ({len(df_elite)}/{len(df)} records > {median_perf:.4f})...")
+        
+        if len(df_elite) < 2:
+            df_elite = df # Fallback if filtering is too aggressive
+        
+        # Prepare Data
+        for f in self.input_features: 
+            if f not in df_elite.columns: df_elite[f] = 0
+            
+        X = self.scaler.fit_transform(df_elite[self.input_features].values)
+        
+        target_cols = ['learning_rate', 'weight_decay_l2', 'batch_size', 'dropout', 'optimizer_type_code']
+        y = df_elite[target_cols].values
+        
         X_tensor = torch.FloatTensor(X).to(self.device)
-        y_tensor = torch.FloatTensor(df[self.output_params].values).to(self.device)
+        y_tensor = torch.FloatTensor(y).to(self.device)
         
         self.model = AdvancedMetaNet(input_dim=X.shape[1]).to(self.device)
         optimizer = optim.Adam(self.model.parameters(), lr=0.003)
         criterion = nn.MSELoss()
         
-        print(f"\n🚀 Training Advanced MetaNet for {epochs} epochs...")
         self.model.train()
         for epoch in range(epochs):
             optimizer.zero_grad()
@@ -120,21 +174,37 @@ class MetaLearner:
             loss = criterion(preds, y_tensor)
             loss.backward()
             optimizer.step()
+            
         self.is_trained = True
-        print("✅ Brain Training Complete.")
+        print(f"✅ Brain Training Complete on Elite Data (Loss: {loss.item():.4f})")
 
     def predict(self, dataset_dna):
-        if not self.is_trained: self.train()
+        """Step D: Prediction with Evolutionary Exploration (Mutation)."""
+        if not self.is_trained:
+            if os.path.exists("meta_brain_weights.pth"):
+                pass 
+            return self._bootstrap_heuristics(dataset_dna)
+
         feats = [dataset_dna.get(f, 0) for f in self.input_features]
         X = self.scaler.transform(np.array(feats).reshape(1, -1))
         X_tensor = torch.FloatTensor(X).to(self.device)
+        
         self.model.eval()
         with torch.no_grad():
             raw_preds = self.model(X_tensor).cpu().numpy()[0]
+            
+        # === EVOLUTIONARY MUTATION (EXPLORATION) ===
+        # Add 10% Gaussian noise to encourage exploring new hyperparameters
+        # This prevents getting stuck in local optima
+        noise = np.random.normal(0, 0.1, size=raw_preds.shape)
+        raw_preds += noise
+            
         return {
-            'learning_rate': float(np.abs(raw_preds[0])), 'weight_decay_l2': float(np.abs(raw_preds[1])),
-            'batch_size': int(np.clip(raw_preds[2], 16, 256)), 'dropout': float(np.clip(np.abs(raw_preds[3]), 0, 0.5)),
-            'optimizer_type': 'adam' if raw_preds[4] > 0.5 else 'sgd', 'confidence_score': 0.92
+            'learning_rate': float(np.abs(raw_preds[0])), 
+            'weight_decay_l2': float(np.abs(raw_preds[1])),
+            'batch_size': int(np.clip(raw_preds[2], 16, 256)), 
+            'dropout': float(np.clip(np.abs(raw_preds[3]), 0, 0.5)),
+            'optimizer_type': 'adam' if raw_preds[4] > 0.5 else 'sgd'
         }
         
     def save(self, path="meta_brain.pkl"):
@@ -144,7 +214,4 @@ class MetaLearner:
     def load(path="meta_brain.pkl"):
         with open(path, 'rb') as f: return pickle.load(f)
 
-if __name__ == "__main__":
-    brain = MetaLearner()
-    brain.train(epochs=60)
-    brain.save()
+

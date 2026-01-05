@@ -1,4 +1,3 @@
-# engine_stream.py
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -10,11 +9,59 @@ from sklearn.preprocessing import StandardScaler, LabelEncoder
 from sklearn.metrics import accuracy_score, f1_score, r2_score
 import time
 import warnings
+from collections import deque
 
-# Suppress warnings
 warnings.filterwarnings('ignore')
 
-class DynamicTrainerStream:
+# ==========================================
+# 1. THE MONITOR (Your "Priority 2" Logic)
+# ==========================================
+class AdaptiveTrainingMonitor:
+    """
+    Real-time Training Stability Analyzer.
+    Detects Plateaus, Overfitting, and Gradient Anomalies.
+    """
+    def __init__(self, window_size=5):
+        self.window_size = window_size
+        self.train_loss_buffer = deque(maxlen=window_size)
+        self.val_loss_buffer = deque(maxlen=window_size)
+        self.gradient_norm_buffer = deque(maxlen=window_size)
+        self.plateau_count = 0
+        self.overfitting_count = 0
+        
+    def update(self, train_loss, val_loss, gradient_norm):
+        self.train_loss_buffer.append(train_loss)
+        self.val_loss_buffer.append(val_loss)
+        self.gradient_norm_buffer.append(gradient_norm)
+    
+    def detect_plateau(self, threshold=0.001):
+        if len(self.train_loss_buffer) < self.window_size: return False
+        loss_change = abs(self.train_loss_buffer[-1] - self.train_loss_buffer[0])
+        is_plateau = loss_change < threshold
+        if is_plateau: self.plateau_count += 1
+        else: self.plateau_count = 0
+        return self.plateau_count >= 2
+    
+    def detect_overfitting(self, threshold=0.05):
+        if len(self.train_loss_buffer) < self.window_size: return False
+        # Val loss up AND Train loss down
+        val_trend = self.val_loss_buffer[-1] - self.val_loss_buffer[0]
+        train_trend = self.train_loss_buffer[-1] - self.train_loss_buffer[0]
+        gap = self.val_loss_buffer[-1] - self.train_loss_buffer[-1]
+        
+        is_overfitting = (val_trend > 0) and (train_trend < 0) and (gap > threshold)
+        if is_overfitting: self.overfitting_count += 1
+        else: self.overfitting_count = 0
+        return self.overfitting_count >= 2
+
+    def detect_vanishing_gradients(self, threshold=1e-4):
+        if len(self.gradient_norm_buffer) < 3: return False
+        return np.mean(self.gradient_norm_buffer) < threshold
+
+# ==========================================
+# 2. THE TRAINER (Merged with Streaming)
+# ==========================================
+class DynamicTrainer:
     def __init__(self, data_path, dataset_dna, hyperparameters, target_col=None):
         self.data_path = data_path
         self.dna = dataset_dna
@@ -22,37 +69,33 @@ class DynamicTrainerStream:
         self.target_col = target_col
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         
-        # Tracking
-        self.train_loss_history = []
-        self.val_loss_history = []
-        self.training_time = 0
+        # Initialize Monitor
+        self.monitor = AdaptiveTrainingMonitor()
+        self.logs = [] # Store adaptation messages
 
     def prepare_data(self):
-        """SCIENTIFICALLY ACCURATE PIPELINE (No Leakage)"""
+        """Leakage-Free Data Prep with Categorical Handling"""
         df = pd.read_csv(self.data_path)
+        if self.target_col is None: self.target_col = df.columns[-1]
         
-        # 1. Identify Target
-        if self.target_col is None: 
-            self.target_col = df.columns[-1]
-            
         X = df.drop(columns=[self.target_col])
         y = df[self.target_col]
 
-        # 2. SPLIT DATA FIRST (The Critical Fix)
+        # 1. SPLIT DATA FIRST (The Critical Fix)
         # We split raw data before doing ANY math on it
         X_train_raw, X_val_raw, y_train_raw, y_val_raw = train_test_split(
             X, y, test_size=0.2, random_state=42
         )
 
-        # 3. Process Numerical Columns
+        # 2. Process Numerical Columns
         # We learn the median/mean ONLY from the Training set
         num_cols = X_train_raw.select_dtypes(include=[np.number]).columns
         if len(num_cols) > 0:
             medians = X_train_raw[num_cols].median()
             X_train_raw[num_cols] = X_train_raw[num_cols].fillna(medians)
-            X_val_raw[num_cols] = X_val_raw[num_cols].fillna(medians) # Apply train medians to val
+            X_val_raw[num_cols] = X_val_raw[num_cols].fillna(medians)
 
-        # 4. Process Categorical Columns (Simple Mode Imputation)
+        # 3. Process Categorical Columns
         cat_cols = X_train_raw.select_dtypes(exclude=[np.number]).columns
         if len(cat_cols) > 0:
             for col in cat_cols:
@@ -60,27 +103,26 @@ class DynamicTrainerStream:
                 X_train_raw[col] = X_train_raw[col].fillna(mode)
                 X_val_raw[col] = X_val_raw[col].fillna(mode)
                 
-                # Simple One-Hot Encoding for robustness
-                # (In production, use a fitted OneHotEncoder to handle unseen labels)
+                # Simple One-Hot Encoding
                 X_train_raw = pd.get_dummies(X_train_raw, columns=[col], drop_first=True)
                 X_val_raw = pd.get_dummies(X_val_raw, columns=[col], drop_first=True)
 
         # Align columns (ensure train/val have same dummy columns)
         X_train_raw, X_val_raw = X_train_raw.align(X_val_raw, join='left', axis=1, fill_value=0)
 
-        # 5. Scaling (Fit on Train, Transform on Val)
+        # 4. Scaling (Fit on Train, Transform on Val)
         self.scaler = StandardScaler()
         X_train = self.scaler.fit_transform(X_train_raw)
         X_val = self.scaler.transform(X_val_raw)
 
-        # 6. Target Encoding
+        # 5. Target Encoding
         if self.dna['task_type'] == 'classification':
-            le = LabelEncoder()
-            y_train = le.fit_transform(y_train_raw)
+            self.le = LabelEncoder()
+            y_train = self.le.fit_transform(y_train_raw)
             # Handle unseen labels in validation conservatively
-            y_val_raw = y_val_raw.map(lambda s: s if s in le.classes_ else le.classes_[0])
-            y_val = le.transform(y_val_raw)
-            self.output_dim = len(le.classes_)
+            y_val_raw = y_val_raw.map(lambda s: s if s in self.le.classes_ else self.le.classes_[0])
+            y_val = self.le.transform(y_val_raw)
+            self.output_dim = len(self.le.classes_)
             self.criterion = nn.CrossEntropyLoss()
         else:
             y_train = y_train_raw.values.reshape(-1, 1)
@@ -88,30 +130,24 @@ class DynamicTrainerStream:
             self.output_dim = 1
             self.criterion = nn.MSELoss()
 
-        # 7. Tensors
-        self.X_train_T = torch.FloatTensor(X_train).to(self.device)
-        self.X_val_T = torch.FloatTensor(X_val).to(self.device)
+        # 6. Tensors
+        dtype_y = torch.LongTensor if self.dna['task_type'] == 'classification' else torch.FloatTensor
         
-        if self.dna['task_type'] == 'classification':
-            self.y_train_T = torch.LongTensor(y_train).to(self.device)
-            self.y_val_T = torch.LongTensor(y_val).to(self.device)
-        else:
-            self.y_train_T = torch.FloatTensor(y_train).to(self.device)
-            self.y_val_T = torch.FloatTensor(y_val).to(self.device)
-
-        # 8. Loaders
-        bs = int(self.params.get('batch_size', 32))
-        self.train_loader = DataLoader(TensorDataset(self.X_train_T, self.y_train_T), batch_size=bs, shuffle=True)
-        self.val_loader = DataLoader(TensorDataset(self.X_val_T, self.y_val_T), batch_size=bs)
+        self.train_loader = DataLoader(
+            TensorDataset(torch.FloatTensor(X_train).to(self.device), dtype_y(y_train).to(self.device)),
+            batch_size=int(self.params['batch_size']), shuffle=True
+        )
+        self.val_loader = DataLoader(
+            TensorDataset(torch.FloatTensor(X_val).to(self.device), dtype_y(y_val).to(self.device)),
+            batch_size=int(self.params['batch_size'])
+        )
         self.input_dim = X_train.shape[1]
 
     def build_model(self):
-        # Dynamic Architecture Construction
         layers = []
         in_dim = self.input_dim
-        
-        # MetaTune Intelligence: Deeper networks for higher entropy
-        depth = 2 if self.dna.get('target_entropy', 0) < 1.0 else 4
+        # MetaTune Intelligence: Deeper for high entropy
+        depth = 4 if self.dna['target_entropy'] > 1.2 else 2
         
         for _ in range(depth):
             out_dim = max(in_dim // 2, 32)
@@ -119,76 +155,111 @@ class DynamicTrainerStream:
                 nn.Linear(in_dim, out_dim),
                 nn.BatchNorm1d(out_dim),
                 nn.ReLU(),
-                nn.Dropout(self.params.get('dropout', 0.2))
+                nn.Dropout(self.params['dropout'])
             ])
             in_dim = out_dim
-            
         layers.append(nn.Linear(in_dim, self.output_dim))
         self.model = nn.Sequential(*layers).to(self.device)
         
-        # Optimizer from Meta-Brain
-        lr = self.params.get('learning_rate', 0.001)
-        wd = self.params.get('weight_decay_l2', 0.0)
+        # Optimizer
+        self.current_lr = self.params['learning_rate']
+        self.current_wd = self.params['weight_decay_l2']
         
-        if self.params.get('optimizer_type', 'adam') == 'adam':
-            self.optimizer = optim.Adam(self.model.parameters(), lr=lr, weight_decay=wd)
+        if self.params['optimizer_type'] == 'adam':
+            self.optimizer = optim.Adam(self.model.parameters(), lr=self.current_lr, weight_decay=self.current_wd)
         else:
-            self.optimizer = optim.SGD(self.model.parameters(), lr=lr, momentum=0.9, weight_decay=wd)
+            self.optimizer = optim.SGD(self.model.parameters(), lr=self.current_lr, momentum=0.9, weight_decay=self.current_wd)
 
-    def run(self, epochs=20):
+    def _update_optimizer(self):
+        """Applies new hyperparameters to the optimizer in real-time"""
+        for param_group in self.optimizer.param_groups:
+            param_group['lr'] = self.current_lr
+            param_group['weight_decay'] = self.current_wd
+
+    def _compute_gradient_norm(self):
+        total_norm = 0.0
+        for p in self.model.parameters():
+            if p.grad is not None:
+                param_norm = p.grad.data.norm(2)
+                total_norm += param_norm.item() ** 2
+        return total_norm ** 0.5
+
+    def run(self, epochs=50):
+        """
+        Runs the training loop and YIELDS data for the UI.
+        Contains the Logic for Dynamic Adaptation.
+        """
         self.prepare_data()
         self.build_model()
         
-        start_time = time.time()
-        
         for epoch in range(epochs):
-            # Train Loop
+            # 1. Training Step
             self.model.train()
-            batch_loss = 0
+            batch_losses = []
+            
             for X_b, y_b in self.train_loader:
                 self.optimizer.zero_grad()
-                pred = self.model(X_b)
-                loss = self.criterion(pred, y_b)
+                out = self.model(X_b)
+                loss = self.criterion(out, y_b)
                 loss.backward()
                 self.optimizer.step()
-                batch_loss += loss.item()
+                batch_losses.append(loss.item())
             
-            avg_train_loss = batch_loss / len(self.train_loader)
+            train_loss = np.mean(batch_losses)
+            grad_norm = self._compute_gradient_norm() # Monitor Gradients
             
-            # Validation Loop
+            # 2. Validation Step
             self.model.eval()
-            val_loss = 0
-            all_preds, all_true = [], []
+            val_losses = []
+            preds, true = [], []
             with torch.no_grad():
                 for X_b, y_b in self.val_loader:
-                    pred = self.model(X_b)
-                    val_loss += self.criterion(pred, y_b).item()
+                    out = self.model(X_b)
+                    val_losses.append(self.criterion(out, y_b).item())
                     if self.dna['task_type'] == 'classification':
-                        all_preds.extend(torch.argmax(pred, 1).cpu().numpy())
+                        preds.extend(torch.argmax(out, 1).cpu().numpy())
                     else:
-                        all_preds.extend(pred.cpu().numpy().flatten())
-                    all_true.extend(y_b.cpu().numpy().flatten())
+                        preds.extend(out.cpu().numpy().flatten())
+                    true.extend(y_b.cpu().numpy().flatten())
             
-            avg_val_loss = val_loss / len(self.val_loader)
+            val_loss = np.mean(val_losses)
+            metric = accuracy_score(true, preds) if self.dna['task_type'] == 'classification' else r2_score(true, preds)
             
-            # Metric Calculation
-            if self.dna['task_type'] == 'classification':
-                metric = accuracy_score(all_true, all_preds)
-                metric_name = "Accuracy"
-            else:
-                metric = r2_score(all_true, all_preds)
-                metric_name = "R2 Score"
-                
-            # Store History
-            self.train_loss_history.append(avg_train_loss)
-            self.val_loss_history.append(avg_val_loss)
+            # 3. DYNAMIC ADAPTATION (The "Real-Time Feedback" Promise)
+            self.monitor.update(train_loss, val_loss, grad_norm)
+            adaptation_msg = None
             
-            # YIELD instead of Callback
-            yield epoch + 1, epochs, avg_train_loss, avg_val_loss, metric, metric_name
-                
-        return {
-            "status": "Optimization Complete",
-            "final_metric": metric,
-            "metric_name": metric_name,
-            "training_time": time.time() - start_time
-        }
+            # Case A: Plateau -> Decrease Learning Rate (Fine-tuning)
+            if self.monitor.detect_plateau():
+                old_lr = self.current_lr
+                self.current_lr *= 0.5
+                self.current_lr = max(self.current_lr, 1e-5)
+                self._update_optimizer()
+                adaptation_msg = f"📉 Plateau Detected: Reduced LR to {self.current_lr:.1e}"
+            
+            # Case B: Overfitting -> Increase Regularization (Robustness)
+            elif self.monitor.detect_overfitting():
+                old_wd = self.current_wd
+                self.current_wd *= 2.0 
+                self.current_wd = min(self.current_wd, 0.1)
+                self._update_optimizer()
+                adaptation_msg = f"🛡️ Overfitting Risk: Increased L2 Reg to {self.current_wd:.1e}"
+            
+            # Case C: Vanishing Gradients -> Boost LR (Acceleration)
+            elif self.monitor.detect_vanishing_gradients():
+                self.current_lr *= 1.5
+                self._update_optimizer()
+                adaptation_msg = f"⚡ Vanishing Gradients: Boosted LR to {self.current_lr:.1e}"
+
+            # 4. Yield Data to Dashboard
+            # We send everything the UI needs to visualize the "Thinking" process
+            yield {
+                "epoch": epoch + 1,
+                "train_loss": train_loss,
+                "val_loss": val_loss,
+                "metric": metric,
+                "current_l2": self.current_wd, # Mapped to Yellow Graph
+                "current_lr": self.current_lr,
+                "grad_norm": grad_norm,
+                "adaptation": adaptation_msg
+            }

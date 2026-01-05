@@ -1,3 +1,4 @@
+
 import argparse
 import json
 import numpy as np
@@ -5,6 +6,7 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import os
 import sys
+sys.stdout.reconfigure(encoding='utf-8')
 
 try:
     from data_analyzer import DatasetAnalyzer
@@ -18,7 +20,7 @@ class MetaTunePipeline:
         self.data_path = data_path; self.target_col = target_col
         self.dataset_dna = None; self.predicted_params = None; self.training_results = None
         
-    def run(self, train_brain=False, epochs=50):
+    def run(self, train_brain=False, epochs=20): # Defaults to 20 for speed
         print("\n" + "="*70 + "\n🚀 METATUNE ENTERPRISE PIPELINE STARTING\n" + "="*70)
         
         # PHASE 1: DIAGNOSIS
@@ -26,13 +28,16 @@ class MetaTunePipeline:
         analyzer = DatasetAnalyzer(self.data_path, target_col=self.target_col)
         if not analyzer.load_data(): return None
         self.dataset_dna = analyzer.analyze()
-        print(f"   ✓ Complexity Score: {self.dataset_dna['target_entropy']:.3f}")
+        print(f"   ✓ Task Type: {self.dataset_dna.get('task_type', 'Unknown')}")
+        print(f"   ✓ Complexity Score: {self.dataset_dna.get('target_entropy', 0):.3f}")
 
         # PHASE 2: PRESCRIPTION
         print("\n🔹 PHASE 2: Neural Hyperparameter Prediction")
         brain = MetaLearner()
-        if os.path.exists("meta_brain.pkl") and not train_brain: brain = MetaLearner.load("meta_brain.pkl")
-        else: brain.train(epochs=50); brain.save("meta_brain.pkl")
+        
+        # Try to train brain if enough data exists
+        brain.train(epochs=30) 
+        
         self.predicted_params = brain.predict(self.dataset_dna)
         print("\n   ✨ OPTIMIZED CONFIGURATION GENERATED:")
         for k, v in self.predicted_params.items(): print(f"   ► {k:20s}: {v}")
@@ -41,6 +46,13 @@ class MetaTunePipeline:
         print("\n🔹 PHASE 3: Training Deployment")
         trainer = DynamicTrainer(self.data_path, self.dataset_dna, self.predicted_params, target_col=self.target_col)
         self.training_results = trainer.run(epochs=epochs)
+        
+        # PHASE 4: FEEDBACK LOOP (Online Learning)
+        print("\n🔹 PHASE 4: Cognitive Feedback Loop")
+        final_metric = self.training_results['final_metric']
+        print(f"   ✓ Run Performance ({self.training_results['metric_name']}): {final_metric:.4f}")
+        
+        brain.store_experience(self.dataset_dna, self.predicted_params, final_metric)
         
         self._generate_report(); self._visualize()
         return self.training_results
@@ -59,6 +71,4 @@ class MetaTunePipeline:
             plt.savefig("metatune_graph.png"); print("📊 Visualization saved: 'metatune_graph.png'")
         except: pass
 
-if __name__ == "__main__":
-    pipeline = MetaTunePipeline(sys.argv[1] if len(sys.argv) > 1 else "demo_data.csv")
-    pipeline.run(train_brain=False, epochs=30)
+

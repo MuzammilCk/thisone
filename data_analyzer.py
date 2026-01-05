@@ -1,3 +1,4 @@
+
 import pandas as pd
 import numpy as np
 from scipy.stats import skew, kurtosis, entropy
@@ -76,6 +77,7 @@ class DatasetAnalyzer:
         # === STATISTICAL COMPLEXITY (Numerical) ===
         if len(num_cols) > 0:
             num_data = features[num_cols]
+            # Handle potential non-numeric values that coerced to NaN
             skew_vals = num_data.apply(lambda x: skew(x.dropna()))
             self.meta_features['mean_skewness'] = skew_vals.mean()
             self.meta_features['max_skewness'] = skew_vals.abs().max()
@@ -108,10 +110,33 @@ class DatasetAnalyzer:
             self.meta_features['avg_cardinality'] = 0.0
             self.meta_features['max_cardinality'] = 0.0
 
-        # === TARGET DIFFICULTY (Task Profiling) ===
+        # === TARGET DIFFICULTY (Task Profiling) - ROBUST FIX ===
         n_unique_target = target.nunique()
-        is_classification = (n_unique_target < 20) or (target.dtype == 'object')
+        is_numeric = pd.api.types.is_numeric_dtype(target)
         
+        # Heuristic for Classification vs Regression
+        # 1. If it's float (with non-integer values) -> Regression
+        # 2. If it's object/string -> Classification
+        # 3. If it's integer:
+        #    - If unique count < 15 -> Classification (likely categorical/ordinal)
+        #    - Else -> Regression (likely count data or continuous attribute like age)
+        
+        is_classification = False
+        
+        if not is_numeric:
+             is_classification = True
+        else:
+            # Check if it has any non-integer values
+            is_float = (target % 1 != 0).any()
+            if is_float:
+                is_classification = False # Definitely Regression
+            else:
+                 # It's integer-like. Check cardinality.
+                 if n_unique_target < 15:
+                     is_classification = True
+                 else:
+                     is_classification = False
+
         if is_classification:
             self.meta_features['task_type'] = 'classification'
             self.meta_features['n_classes'] = n_unique_target
@@ -122,6 +147,8 @@ class DatasetAnalyzer:
             max_ent = np.log(n_unique_target) if n_unique_target > 1 else 1
             self.meta_features['normalized_entropy'] = self.meta_features['target_entropy'] / max_ent
             self.meta_features['minority_class_pct'] = counts.min() / len(target)
+            self.meta_features['target_skewness'] = 0.0
+            self.meta_features['target_cv'] = 0.0
         else:
             self.meta_features['task_type'] = 'regression'
             self.meta_features['n_classes'] = 0
@@ -130,7 +157,7 @@ class DatasetAnalyzer:
             self.meta_features['normalized_entropy'] = 0.0
             self.meta_features['minority_class_pct'] = 0.0
             
-            if pd.api.types.is_numeric_dtype(target):
+            if is_numeric:
                 self.meta_features['target_skewness'] = skew(target.dropna())
                 self.meta_features['target_cv'] = target.std() / (abs(target.mean()) + 1e-9)
 
@@ -141,26 +168,20 @@ class DatasetAnalyzer:
         if not self.meta_features: return
         print("\n" + "="*60 + "\nDATASET DNA (Meta-Features)\n" + "="*60)
         def _print_row(key, val):
-            print(f"  {key:25s}: {val:.4f}" if isinstance(val, float) else f"  {key:25s}: {val}")
+            if isinstance(val, (int, float)):
+                 print(f"  {key:25s}: {val:.4f}")
+            else:
+                 print(f"  {key:25s}: {val}")
+                 
         print("Dimensions:")
         _print_row("Instances", self.meta_features['n_instances'])
         _print_row("Features", self.meta_features['n_features'])
         print("\nComplexity Metrics:")
+        _print_row("Task Type", self.meta_features.get('task_type', 'Unknown'))
         _print_row("Target Entropy", self.meta_features.get('target_entropy', 0))
         _print_row("Mean Skewness", self.meta_features.get('mean_skewness', 0))
         _print_row("Sparsity/Missing", self.meta_features.get('sparsity', 0))
         _print_row("Imbalance Ratio", self.meta_features.get('class_imbalance_ratio', 0))
         print("="*60)
 
-if __name__ == "__main__":
-    if len(sys.argv) < 2:
-        print("\n❌ USAGE ERROR\nUsage: python dataset_analyzer.py <path_to_csv> [target_column]")
-        sys.exit(1)
-    file_path = sys.argv[1]
-    target_col = sys.argv[2] if len(sys.argv) > 2 else None
-    print("\n" + "="*60 + f"\n🧬 ANALYZING DATASET: {os.path.basename(file_path)}\n" + "="*60)
-    analyzer = DatasetAnalyzer(file_path, target_col=target_col)
-    if analyzer.load_data():
-        dna = analyzer.analyze()
-        analyzer.print_summary()
-        print("\n✅ Analysis Complete. DNA ready for Meta-Brain.")
+

@@ -1,3 +1,4 @@
+
 # engine.py
 import torch
 import torch.nn as nn
@@ -6,10 +7,14 @@ from torch.utils.data import DataLoader, TensorDataset
 import pandas as pd
 import numpy as np
 from sklearn.model_selection import train_test_split
-from sklearn.preprocessing import StandardScaler, LabelEncoder
-from sklearn.metrics import accuracy_score, f1_score, r2_score
+from sklearn.preprocessing import StandardScaler, OneHotEncoder, LabelEncoder
+from sklearn.compose import ColumnTransformer
+from sklearn.pipeline import Pipeline
+from sklearn.impute import SimpleImputer
+from sklearn.metrics import accuracy_score, r2_score
 import time
 import warnings
+import joblib 
 
 # Suppress warnings
 warnings.filterwarnings('ignore')
@@ -45,51 +50,63 @@ class DynamicTrainer:
             X, y, test_size=0.2, random_state=42
         )
 
-        # 3. Process Numerical Columns
-        # We learn the median/mean ONLY from the Training set
+        # 3. Define Preprocessing Pipeline
+        # Identify numeric and categorical columns
         num_cols = X_train_raw.select_dtypes(include=[np.number]).columns
-        if len(num_cols) > 0:
-            medians = X_train_raw[num_cols].median()
-            X_train_raw[num_cols] = X_train_raw[num_cols].fillna(medians)
-            X_val_raw[num_cols] = X_val_raw[num_cols].fillna(medians) # Apply train medians to val
-
-        # 4. Process Categorical Columns (Simple Mode Imputation)
         cat_cols = X_train_raw.select_dtypes(exclude=[np.number]).columns
-        if len(cat_cols) > 0:
-            for col in cat_cols:
-                mode = X_train_raw[col].mode()[0]
-                X_train_raw[col] = X_train_raw[col].fillna(mode)
-                X_val_raw[col] = X_val_raw[col].fillna(mode)
-                
-                # Simple One-Hot Encoding for robustness
-                # (In production, use a fitted OneHotEncoder to handle unseen labels)
-                X_train_raw = pd.get_dummies(X_train_raw, columns=[col], drop_first=True)
-                X_val_raw = pd.get_dummies(X_val_raw, columns=[col], drop_first=True)
 
-        # Align columns (ensure train/val have same dummy columns)
-        X_train_raw, X_val_raw = X_train_raw.align(X_val_raw, join='left', axis=1, fill_value=0)
+        numeric_transformer = Pipeline(steps=[
+            ('imputer', SimpleImputer(strategy='median')),
+            ('scaler', StandardScaler())
+        ])
 
-        # 5. Scaling (Fit on Train, Transform on Val)
-        self.scaler = StandardScaler()
-        X_train = self.scaler.fit_transform(X_train_raw)
-        X_val = self.scaler.transform(X_val_raw)
+        categorical_transformer = Pipeline(steps=[
+            ('imputer', SimpleImputer(strategy='most_frequent')),
+            ('onehot', OneHotEncoder(handle_unknown='ignore', sparse_output=False))
+        ])
 
-        # 6. Target Encoding
+        self.preprocessor = ColumnTransformer(
+            transformers=[
+                ('num', numeric_transformer, num_cols),
+                ('cat', categorical_transformer, cat_cols)
+            ]
+        )
+
+        # 4. Fit and Transform
+        # Fit ONLY on Training Data
+        X_train = self.preprocessor.fit_transform(X_train_raw)
+        # Transform Validation Data (using statistics from Train)
+        X_val = self.preprocessor.transform(X_val_raw)
+
+        # Save the pipeline for Inference
+        joblib.dump(self.preprocessor, 'preprocessing_pipeline.pkl')
+
+        # 5. Target Encoding
         if self.dna['task_type'] == 'classification':
-            le = LabelEncoder()
-            y_train = le.fit_transform(y_train_raw)
-            # Handle unseen labels in validation conservatively
-            y_val_raw = y_val_raw.map(lambda s: s if s in le.classes_ else le.classes_[0])
-            y_val = le.transform(y_val_raw)
-            self.output_dim = len(le.classes_)
+            self.le = LabelEncoder()
+            y_train = self.le.fit_transform(y_train_raw)
+            # Handle unseen labels in validation conservatively by mapping to a safe default if needed
+            # For simplicity in this demo, we assume validation labels are seen, or we use a mask
+            # A more robust way is to filter valid indices or use a dedicated Unknown token
+            
+            # Simple check: map unseen to -1 then filter? 
+            # Or just assume standard split covers it for this POC. 
+            # Ideally LabelEncoder isn't great for unseen targets.
+            
+            # Safe transform:
+            y_val_np = y_val_raw.to_numpy()
+            y_val_masked = np.array([x if x in self.le.classes_ else self.le.classes_[0] for x in y_val_np])
+            y_val = self.le.transform(y_val_masked)
+            
+            self.output_dim = len(self.le.classes_)
             self.criterion = nn.CrossEntropyLoss()
         else:
-            y_train = y_train_raw.values.reshape(-1, 1)
-            y_val = y_val_raw.values.reshape(-1, 1)
+            y_train = y_train_raw.values.reshape(-1, 1).astype(np.float32)
+            y_val = y_val_raw.values.reshape(-1, 1).astype(np.float32)
             self.output_dim = 1
             self.criterion = nn.MSELoss()
 
-        # 7. Tensors
+        # 6. Tensors
         self.X_train_T = torch.FloatTensor(X_train).to(self.device)
         self.X_val_T = torch.FloatTensor(X_val).to(self.device)
         
@@ -100,7 +117,7 @@ class DynamicTrainer:
             self.y_train_T = torch.FloatTensor(y_train).to(self.device)
             self.y_val_T = torch.FloatTensor(y_val).to(self.device)
 
-        # 8. Loaders
+        # 7. Loaders
         bs = int(self.params.get('batch_size', 32))
         self.train_loader = DataLoader(TensorDataset(self.X_train_T, self.y_train_T), batch_size=bs, shuffle=True)
         self.val_loader = DataLoader(TensorDataset(self.X_val_T, self.y_val_T), batch_size=bs)
@@ -141,7 +158,9 @@ class DynamicTrainer:
         self.build_model()
         
         start_time = time.time()
-        
+        metric = 0.0
+        metric_name = "Metric"
+
         for epoch in range(epochs):
             # Train Loop
             self.model.train()
